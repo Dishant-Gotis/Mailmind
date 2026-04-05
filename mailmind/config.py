@@ -8,11 +8,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from exceptions import ConfigurationError
 
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
 class Config(BaseSettings):
     """Central configuration for MailMind loaded from .env."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=BASE_DIR / ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -51,12 +54,14 @@ class Config(BaseSettings):
     @property
     def calendar_credentials_path(self) -> Path:
         """Resolved Path object for credentials.json."""
-        return Path(self.google_calendar_credentials_path)
+        path = Path(self.google_calendar_credentials_path)
+        return path if path.is_absolute() else BASE_DIR / path
 
     @property
     def calendar_token_path(self) -> Path:
         """Resolved Path object for token.json."""
-        return Path(self.google_calendar_token_path)
+        path = Path(self.google_calendar_token_path)
+        return path if path.is_absolute() else BASE_DIR / path
 
     # ── Field validators ───────────────────────────────────────────────────────
 
@@ -104,16 +109,16 @@ class Config(BaseSettings):
     @field_validator("imap_poll_interval_seconds")
     @classmethod
     def validate_poll_interval(cls, value: int) -> int:
-        if value < 10:
+        if value < 3:
             raise ValueError(
-                "IMAP_POLL_INTERVAL_SECONDS must be at least 10 seconds to avoid Gmail "
+                "IMAP_POLL_INTERVAL_SECONDS must be at least 3 seconds to avoid Gmail "
                 f"rate limiting, got {value}."
             )
         return value
 
     @model_validator(mode="after")
     def validate_credentials_file_exists(self) -> "Config":
-        creds_path = Path(self.google_calendar_credentials_path)
+        creds_path = self.calendar_credentials_path
         if not creds_path.exists():
             raise ValueError(
                 f"GOOGLE_CALENDAR_CREDENTIALS_PATH points to '{creds_path}' which does not exist. "

@@ -55,8 +55,12 @@ def route_by_completeness(state: dict) -> str:
     thread_id = state.get("thread_id", "")
     pending = state.get("pending_responses", [])
     draft = state.get("outbound_draft")
+    slots_per_participant = state.get("slots_per_participant", {})
+    has_collected_slots = any(slots_per_participant.values())
 
-    if draft:
+    # If we have a clarification draft and no slots yet, we must send it even in
+    # direct-email scenarios where pending can be empty (only sender + bot).
+    if draft and (pending or not has_collected_slots):
         logger.debug(
             "route_by_completeness: clarification draft present -> %s",
             _AMBIGUITY_NODE,
@@ -65,6 +69,14 @@ def route_by_completeness(state: dict) -> str:
         return _AMBIGUITY_NODE
 
     if not pending:
+        if not has_collected_slots:
+            logger.debug(
+                "route_by_completeness: no collected slots yet -> %s",
+                _END,
+                extra={"thread_id": thread_id},
+            )
+            return _END
+
         logger.debug(
             "route_by_completeness: all participants responded -> %s",
             _OVERLAP_NODE,

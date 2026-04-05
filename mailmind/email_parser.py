@@ -24,6 +24,9 @@ from models import EmailObject
 
 logger = get_logger(__name__)
 
+_THREAD_ID_CACHE: dict[str, str] = {}
+_SUBJECT_THREAD_CACHE: dict[str, str] = {}
+
 
 def parse_email(raw_bytes: bytes) -> EmailObject:
     """
@@ -56,8 +59,10 @@ def parse_email(raw_bytes: bytes) -> EmailObject:
     sender_email = sender_email.lower().strip()
     sender_name = sender_name.strip()
 
-    # ── Parse Message-ID ───────────────────────────────────────────────────────
+    # ── Parse Message-ID / Subject ────────────────────────────────────────────
     message_id = msg.get("Message-ID", "").strip()
+    subject = msg.get("Subject", "").strip()
+    subject_key = _normalise_subject(subject)
 
     # ── Derive thread_id from References header ────────────────────────────────
     references_header = msg.get("References", "").strip()
@@ -65,16 +70,24 @@ def parse_email(raw_bytes: bytes) -> EmailObject:
         all_refs = references_header.split()
         from checkpointer import find_thread_by_any_ref
         existing_tid = find_thread_by_any_ref(all_refs)
-        thread_id = existing_tid if existing_tid else all_refs[0].strip()
+        if existing_tid:
+            thread_id = existing_tid
+        else:
+            thread_id = _lookup_cached_thread_id(all_refs, subject_key)
+            if thread_id is None:
+                thread_id = all_refs[0].strip()
     else:
         thread_id = message_id if message_id else _generate_fallback_id(sender_email, date_header)
+
+    if message_id:
+        _THREAD_ID_CACHE[message_id] = thread_id
+    if subject_key:
+        _SUBJECT_THREAD_CACHE.setdefault(subject_key, thread_id)
 
     # ── Parse In-Reply-To ─────────────────────────────────────────────────────
     in_reply_to = msg.get("In-Reply-To", "").strip()
 
     # ── Parse Subject ─────────────────────────────────────────────────────────
-    subject = msg.get("Subject", "").strip()
-
     # ── Parse recipients (To + CC) ────────────────────────────────────────────
     recipients: list[str] = []
     for header_name in ("To", "Cc"):
@@ -178,3 +191,25 @@ def _generate_fallback_id(sender_email: str, date_str: str) -> str:
     import hashlib
     raw = f"{sender_email}:{date_str}"
     return "fallback-" + hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def _lookup_cached_thread_id(refs: list[str], subject_key: str) -> str | None:
+    for ref in refs:
+        cached = _THREAD_ID_CACHE.get(ref.strip())
+        if cached:
+            return cached
+
+    if subject_key:
+        cached = _SUBJECT_THREAD_CACHE.get(subject_key)
+        if cached:
+            return cached
+
+    return None
+
+
+def _normalise_subject(subject: str) -> str:
+    cleaned = subject.strip().lower()
+    for prefix in ("re:", "fwd:", "fw:"):
+        while cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+    return cleaned

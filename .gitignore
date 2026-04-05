@@ -26,6 +26,8 @@ mailmind/credentials.json
 mailmind/token.json
 
 # Local data/runtime artifacts
+data/
+.kombai/
 mailmind/data/
 mailmind/*.db
 mailmind/pytest_output.txt
@@ -35,6 +37,12 @@ mailmind/setup_clean.txt
 mailmind/startup_log.txt
 mailmind/startup_log_2.txt
 mailmind/*.log
+mailmind/debug_regex.py
+mailmind/diagnostic_emails.py
+mailmind/send_self_test_email.py
+mailmind/send_test_email.py
+mailmind/test_parsing.py
+mailmind/test_parsing_v2.py
 
 # Project Documentation
 *.md

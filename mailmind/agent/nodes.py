@@ -9,6 +9,7 @@ Routing decisions are made by agent/loop.py using agent/graph.py.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 
 from checkpointer import clear_state
@@ -29,6 +30,7 @@ from tool_registry import ALL_TOOL_SCHEMAS, call_tool
 logger = get_logger(__name__)
 
 MAX_COORDINATION_RESTARTS = 2
+MAX_CLARIFICATION_ROUNDS = 2
 VALID_APPROVAL_STATUSES = {"approved", "rejected", "timeout"}
 
 
@@ -79,6 +81,128 @@ def send_alert(message: str) -> None:
     logger.error("ALERT: %s", message)
 
 
+def _is_affirmative_without_time(text: str) -> bool:
+    """
+    Detect short affirmative replies that imply agreement but omit a concrete time.
+    """
+    # Only inspect fresh reply content, not quoted thread tails.
+    fresh_text = _extract_fresh_reply_text(text)
+    lowered = fresh_text.lower().strip()
+    affirmative_patterns = [
+        r"\byes\b",
+        r"\bworks for me\b",
+        r"\bi am available\b",
+        r"\bavailable\b",
+        r"\bsounds good\b",
+        r"\bok\b",
+        r"\bagreed\b",
+    ]
+    if not any(re.search(p, lowered) for p in affirmative_patterns):
+        return False
+
+    has_time_markers = bool(
+        re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.|utc|ist|pst|est)\b", lowered)
+        or re.search(
+            r"\b(tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\s+\w+)\b",
+            lowered,
+        )
+    )
+    return not has_time_markers
+
+
+def _extract_fresh_reply_text(text: str) -> str:
+    """
+    Return only the newest reply content, excluding quoted thread tails.
+    """
+    fresh_text = text.split("\nOn ")[0]
+    fresh_text = fresh_text.split("\n>")[0]
+    return fresh_text.strip()
+
+
+def _extract_quoted_reply_text(text: str) -> str:
+    """
+    Return quoted thread content with quote markers removed.
+    """
+    marker = "\nOn "
+    idx = text.find(marker)
+    if idx == -1:
+        return ""
+
+    quoted_part = text[idx + 1 :].strip()
+    cleaned_lines: list[str] = []
+    for line in quoted_part.splitlines():
+        cleaned_lines.append(re.sub(r"^\s*>\s?", "", line))
+    return "\n".join(cleaned_lines).strip()
+
+
+def _inherit_slots_from_thread_context(state: AgentState, sender: str) -> list[dict]:
+    """
+    Copy latest known slots from another participant onto the sender.
+    """
+    sender_norm = _normalise_email(sender)
+    slots_per_participant = state.get("slots_per_participant", {})
+
+    for participant, slots in slots_per_participant.items():
+        participant_norm = _normalise_email(participant)
+        if participant_norm == sender_norm:
+            continue
+        if not slots:
+            continue
+
+        inherited = []
+        for slot in slots:
+            copied = dict(slot)
+            copied["participant"] = sender_norm
+            inherited.append(copied)
+        return inherited
+
+    return []
+
+
+def _build_llm_clarification(email_obj: EmailObject, thread_id: str, state: AgentState | None = None) -> str:
+    """
+    Generate a concise clarification question using LLM with a safe fallback.
+    """
+    default_question = (
+        "I could not confidently understand your scheduling intent. "
+        "Could you share 2-3 exact date/time windows in your timezone? "
+        "Example: Monday 07 Apr 10:00-11:00 IST, Tuesday 08 Apr 14:00-15:00 IST."
+    )
+
+    try:
+        user_text = email_obj.get("body", "").strip()
+        history = []
+        if state:
+            history = state.get("history", [])[-4:]
+        history_text = "\n".join(
+            [f"{h.get('role', 'unknown')}: {h.get('content', '')}" for h in history]
+        )
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an email scheduling assistant. "
+                    "Write ONE polite, short clarification question asking for specific availability. "
+                    "Do not include markdown. Do not include more than 2 sentences."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "The user message was unclear for scheduling extraction:\n\n"
+                    f"{user_text}\n\n"
+                    "Recent thread context:\n"
+                    f"{history_text}\n\n"
+                    "Ask them to provide concrete date/time windows with timezone."
+                ),
+            },
+        ]
+        text = call_for_text(prompt, thread_id=thread_id, temperature=0.2, max_tokens=120).strip()
+        return text or default_question
+    except Exception:
+        return default_question
+
+
 # Node 1: triage_node
 
 def triage_node(state: AgentState, email_obj: EmailObject) -> AgentState:
@@ -92,11 +216,26 @@ def triage_node(state: AgentState, email_obj: EmailObject) -> AgentState:
         result = call_with_tools(messages, schema, thread_id=thread_id, temperature=0.2)
 
         state["intent"] = result.get("intent", "noise")
+        if state["intent"] == "reschedule":
+            state["slots_per_participant"] = {}
+            state["ranked_slot"] = None
+            state["rank_below_threshold"] = False
+            state["pending_responses"] = list(state.get("participants", []))
+            state["overlap_candidates"] = []
+            state["coordination_restart_count"] = 0
         append_to_history(state, "user", email_obj.get("body", ""))
         append_to_history(state, "assistant", f"Intent classified: {state['intent']}")
 
         logger.info("triage_node: intent=%s", state["intent"], extra={"thread_id": thread_id})
-    except (OpenRouterAPIError, LowConfidenceError, ToolNotFoundError) as exc:
+    except LowConfidenceError as exc:
+        # Graceful fallback: do not hard-fail low-confidence classification.
+        # Route into coordination with an ambiguity flag so we can ask a clear follow-up.
+        state["intent"] = "scheduling"
+        state["triage_ambiguous"] = True
+        append_to_history(state, "user", email_obj.get("body", ""))
+        append_to_history(state, "assistant", "Low-confidence intent; requesting clarification.")
+        logger.warning("triage_node low-confidence fallback: %s", exc, extra={"thread_id": thread_id})
+    except (OpenRouterAPIError, ToolNotFoundError) as exc:
         logger.error("triage_node error: %s", exc, extra={"thread_id": thread_id})
         state["error"] = str(exc)
         state["current_node"] = "error_node"
@@ -117,10 +256,21 @@ def coordination_node(state: AgentState, email_obj: EmailObject) -> AgentState:
     state.setdefault("ambiguity_rounds", {})
     state.setdefault("preferences", {})
 
+    if state.pop("triage_ambiguous", False):
+        state["outbound_draft"] = _build_llm_clarification(email_obj, thread_id, state)
+        logger.info(
+            "coordination_node: triage ambiguity fallback triggered for %s",
+            sender,
+            extra={"thread_id": thread_id},
+        )
+        return state
+
     if not state["pending_responses"]:
         state["pending_responses"] = _build_pending_responses(state, sender)
 
     sender_tz = state["preferences"].get(sender, {}).get("timezone", "UTC")
+    body_text = email_obj.get("body", "")
+    fresh_body_text = _extract_fresh_reply_text(body_text)
 
     try:
         ambiguity_schema = [
@@ -135,11 +285,56 @@ def coordination_node(state: AgentState, email_obj: EmailObject) -> AgentState:
         )
 
         if amb_result.get("is_ambiguous"):
+            if _is_affirmative_without_time(body_text):
+                inherited_slots = _inherit_slots_from_thread_context(state, sender)
+                if not inherited_slots:
+                    quoted_text = _extract_quoted_reply_text(body_text)
+                    if quoted_text:
+                        quoted_parse = call_tool(
+                            "parse_availability",
+                            {"text": quoted_text, "sender_tz": sender_tz},
+                        )
+                        inherited_slots = quoted_parse.get("slots", [])
+                        for slot in inherited_slots:
+                            slot["participant"] = sender
+                if inherited_slots:
+                    call_tool(
+                        "track_participant_slots",
+                        {
+                            "thread_id": thread_id,
+                            "email": sender,
+                            "slots": inherited_slots,
+                        },
+                    )
+
+                    existing = list(state["slots_per_participant"].get(sender, []))
+                    existing.extend(inherited_slots)
+                    state["slots_per_participant"][sender] = existing
+
+                    if sender in state["pending_responses"]:
+                        state["pending_responses"].remove(sender)
+
+                    state["outbound_draft"] = None
+                    append_to_history(
+                        state,
+                        "assistant",
+                        f"Affirmative reply from {sender}; inherited {len(inherited_slots)} slot(s) from thread context.",
+                    )
+                    logger.info(
+                        "coordination_node: affirmative from %s; inherited %d slot(s). Pending=%s",
+                        sender,
+                        len(inherited_slots),
+                        state["pending_responses"],
+                        extra={"thread_id": thread_id},
+                    )
+                    return state
+
             rounds = state["ambiguity_rounds"].get(sender, 0)
             state["ambiguity_rounds"][sender] = rounds + 1
-            state["outbound_draft"] = amb_result.get(
-                "question",
-                "Could you please share 2-3 exact date/time windows in your timezone?",
+            state["outbound_draft"] = amb_result.get("question") or _build_llm_clarification(
+                email_obj,
+                thread_id,
+                state,
             )
             logger.info(
                 "coordination_node: ambiguity detected for %s (round %d)",
@@ -152,7 +347,7 @@ def coordination_node(state: AgentState, email_obj: EmailObject) -> AgentState:
         _ = build_coordination_prompt(email_obj, state)
         avail_result = call_tool(
             "parse_availability",
-            {"text": email_obj.get("body", ""), "sender_tz": sender_tz},
+            {"text": fresh_body_text, "sender_tz": sender_tz},
         )
         slots = avail_result.get("slots", [])
 
@@ -172,20 +367,81 @@ def coordination_node(state: AgentState, email_obj: EmailObject) -> AgentState:
         existing.extend(slots)
         state["slots_per_participant"][sender] = existing
 
-        if sender in state["pending_responses"]:
-            state["pending_responses"].remove(sender)
-
-        state["outbound_draft"] = None
         append_to_history(state, "user", email_obj.get("body", ""))
-        append_to_history(state, "assistant", f"Parsed {len(slots)} slot(s) from {sender}.")
 
-        logger.info(
-            "coordination_node: %d slot(s) parsed from %s. Pending=%s",
-            len(slots),
-            sender,
-            state["pending_responses"],
-            extra={"thread_id": thread_id},
-        )
+        if not slots:
+            if _is_affirmative_without_time(body_text):
+                inherited_slots = _inherit_slots_from_thread_context(state, sender)
+                if not inherited_slots:
+                    quoted_text = _extract_quoted_reply_text(body_text)
+                    if quoted_text:
+                        quoted_parse = call_tool(
+                            "parse_availability",
+                            {"text": quoted_text, "sender_tz": sender_tz},
+                        )
+                        inherited_slots = quoted_parse.get("slots", [])
+                        for slot in inherited_slots:
+                            slot["participant"] = sender
+                if inherited_slots:
+                    call_tool(
+                        "track_participant_slots",
+                        {
+                            "thread_id": thread_id,
+                            "email": sender,
+                            "slots": inherited_slots,
+                        },
+                    )
+
+                    existing = list(state["slots_per_participant"].get(sender, []))
+                    existing.extend(inherited_slots)
+                    state["slots_per_participant"][sender] = existing
+
+                    if sender in state["pending_responses"]:
+                        state["pending_responses"].remove(sender)
+
+                    state["outbound_draft"] = None
+                    append_to_history(
+                        state,
+                        "assistant",
+                        f"Affirmative fallback from {sender}; inherited {len(inherited_slots)} slot(s).",
+                    )
+                    logger.info(
+                        "coordination_node: affirmative fallback from %s; inherited %d slot(s). Pending=%s",
+                        sender,
+                        len(inherited_slots),
+                        state["pending_responses"],
+                        extra={"thread_id": thread_id},
+                    )
+                    return state
+
+            if sender not in state["pending_responses"]:
+                state["pending_responses"].append(sender)
+            state["outbound_draft"] = _build_llm_clarification(email_obj, thread_id, state)
+            append_to_history(
+                state,
+                "assistant",
+                "No availability could be parsed; requesting clarification.",
+            )
+            logger.info(
+                "coordination_node: no availability parsed from %s. Pending=%s",
+                sender,
+                state["pending_responses"],
+                extra={"thread_id": thread_id},
+            )
+        else:
+            if sender in state["pending_responses"]:
+                state["pending_responses"].remove(sender)
+
+            state["outbound_draft"] = None
+            append_to_history(state, "assistant", f"Parsed {len(slots)} slot(s) from {sender}.")
+
+            logger.info(
+                "coordination_node: %d slot(s) parsed from %s. Pending=%s",
+                len(slots),
+                sender,
+                state["pending_responses"],
+                extra={"thread_id": thread_id},
+            )
     except Exception as exc:
         logger.error("coordination_node error: %s", exc, extra={"thread_id": thread_id})
         state["error"] = str(exc)
@@ -201,9 +457,24 @@ def ambiguity_node(state: AgentState, email_obj: EmailObject) -> AgentState:
     """
     thread_id = state["thread_id"]
     sender = _normalise_email(email_obj["sender_email"])
+    if not state.get("pending_responses"):
+        # Direct-email case can legitimately have no pending participants while
+        # still requiring a clarification draft to be sent back to the sender.
+        if state.get("outbound_draft"):
+            logger.info(
+                "ambiguity_node: no pending responses; preserving clarification draft for sender.",
+                extra={"thread_id": thread_id},
+            )
+        else:
+            logger.info(
+                "ambiguity_node: no pending responses and no draft present.",
+                extra={"thread_id": thread_id},
+            )
+        return state
+
     rounds = state.get("ambiguity_rounds", {}).get(sender, 0)
 
-    if rounds >= 2:
+    if rounds >= MAX_CLARIFICATION_ROUNDS:
         state.setdefault("non_responsive", [])
         if sender not in state["non_responsive"]:
             state["non_responsive"].append(sender)
@@ -300,10 +571,17 @@ def rank_slots_node(state: AgentState, email_obj: EmailObject) -> AgentState:
             state["slots_per_participant"] = {}
             state["overlap_candidates"] = []
             non_responsive = {_normalise_email(e) for e in state.get("non_responsive", [])}
+            bot_email = ""
+            try:
+                from config import config
+
+                bot_email = _normalise_email(config.gmail_address)
+            except Exception:
+                bot_email = ""
             state["pending_responses"] = [
                 _normalise_email(p)
                 for p in state.get("participants", [])
-                if _normalise_email(p) not in non_responsive
+                if _normalise_email(p) not in non_responsive and _normalise_email(p) != bot_email
             ]
             logger.warning(
                 "rank_slots_node: score below threshold, restart_count=%d",

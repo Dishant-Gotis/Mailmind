@@ -133,7 +133,7 @@ def rank_slots(
     latest = max(starts)
     time_span_seconds = max((latest - earliest).total_seconds(), 1.0)
 
-    scored: list[tuple[float, dict, str]] = []
+    scored: list[tuple[float, dict, str, float]] = []
     for slot in candidate_slots:
         slot_start = _parse_dt(slot.get("start_utc"))
         slot_hour = slot_start.hour
@@ -196,16 +196,22 @@ def rank_slots(
         if total_penalty > 0:
             reason_parts.append(f"soft penalty {total_penalty:.2f} applied")
 
-        scored.append((final_score, slot, "; ".join(reason_parts)))
+        scored.append((final_score, slot, "; ".join(reason_parts), attendance_score))
 
     scored.sort(key=lambda row: row[0], reverse=True)
-    best_score, best_slot, best_reason = scored[0]
+    best_score, best_slot, best_reason, best_attendance = scored[0]
 
-    below_threshold = best_score < SLOT_SCORE_THRESHOLD
+    # Even if other factors inflate score, low attendance must fail threshold.
+    below_threshold = (
+        best_score < SLOT_SCORE_THRESHOLD
+        or best_attendance < config.attendance_threshold
+    )
     if below_threshold:
         logger.warning(
-            "Best slot score %.4f is below threshold %.2f; coordination restart needed.",
+            "Best slot rejected (score=%.4f, attendance=%.2f, attendance_threshold=%.2f, score_threshold=%.2f).",
             best_score,
+            best_attendance,
+            config.attendance_threshold,
             SLOT_SCORE_THRESHOLD,
         )
 
