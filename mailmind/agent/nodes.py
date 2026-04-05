@@ -9,6 +9,7 @@ Routing decisions are made by agent/loop.py using agent/graph.py.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timedelta
 
@@ -32,6 +33,7 @@ logger = get_logger(__name__)
 MAX_COORDINATION_RESTARTS = 2
 MAX_CLARIFICATION_ROUNDS = 2
 VALID_APPROVAL_STATUSES = {"approved", "rejected", "timeout"}
+LLM_FALLBACK_CONFIDENCE_THRESHOLD = 0.72
 
 
 def _normalise_email(email: str) -> str:
@@ -157,6 +159,283 @@ def _inherit_slots_from_thread_context(state: AgentState, sender: str) -> list[d
         return inherited
 
     return []
+
+
+def _latest_proposed_slot(state: AgentState, sender: str) -> dict | None:
+    """
+    Return the most recent slot proposed by someone other than sender.
+    """
+    sender_norm = _normalise_email(sender)
+    latest_slot: dict | None = None
+    latest_start = ""
+
+    for participant, slots in state.get("slots_per_participant", {}).items():
+        if _normalise_email(participant) == sender_norm:
+            continue
+
+        for slot in slots or []:
+            start_iso = _slot_start_iso(slot)
+            if not start_iso:
+                continue
+            if not latest_start or start_iso > latest_start:
+                latest_start = start_iso
+                latest_slot = dict(slot)
+
+    ranked_slot = state.get("ranked_slot")
+    ranked_start = _slot_start_iso(ranked_slot) if isinstance(ranked_slot, dict) else None
+    if ranked_start and (not latest_start or ranked_start > latest_start):
+        latest_slot = dict(ranked_slot)
+
+    if not latest_slot:
+        return None
+
+    latest_slot["participant"] = sender_norm
+    return latest_slot
+
+
+def _track_slots_for_sender(state: AgentState, thread_id: str, sender: str, slots: list[dict]) -> None:
+    """
+    Persist slots for sender and clear sender from pending responses.
+    """
+    call_tool(
+        "track_participant_slots",
+        {
+            "thread_id": thread_id,
+            "email": sender,
+            "slots": slots,
+        },
+    )
+
+    existing = list(state["slots_per_participant"].get(sender, []))
+    existing.extend(slots)
+    state["slots_per_participant"][sender] = existing
+
+    if sender in state["pending_responses"]:
+        state["pending_responses"].remove(sender)
+
+    state["outbound_draft"] = None
+
+
+def _llm_fallback_decision(
+    state: AgentState,
+    email_obj: EmailObject,
+    thread_id: str,
+    sender: str,
+    fresh_body_text: str,
+) -> dict:
+    """
+    Use LLM to infer meaning when parser returns zero slots or ambiguity is detected.
+    """
+    default = {
+        "decision_type": "ask_clarification",
+        "confidence": 0.0,
+        "clarification_question": "",
+        "normalized_time_text": "",
+    }
+
+    latest_slot = _latest_proposed_slot(state, sender)
+    latest_slot_text = "none"
+    if latest_slot:
+        latest_slot_text = (
+            f"start={latest_slot.get('start_utc')} end={latest_slot.get('end_utc')} "
+            f"tz={latest_slot.get('timezone', 'UTC')}"
+        )
+
+    history = state.get("history", [])[-6:]
+    history_text = "\n".join(
+        [f"{h.get('role', 'unknown')}: {h.get('content', '')}" for h in history]
+    )
+
+    quoted_text = _extract_quoted_reply_text(email_obj.get("body", ""))
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an email scheduling disambiguation assistant. "
+                "Return ONLY one JSON object with keys: decision_type, confidence, "
+                "clarification_question, normalized_time_text. "
+                "Allowed decision_type values: confirm_latest_slot, new_time_details, "
+                "decline_latest_slot, ask_clarification. "
+                "Do not include markdown or extra text."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Determine what the latest sender message means for scheduling.\n\n"
+                f"Sender: {sender}\n"
+                f"Subject: {email_obj.get('subject', '')}\n"
+                f"Latest sender message: {fresh_body_text}\n"
+                f"Quoted context: {quoted_text}\n"
+                f"Latest proposed slot in thread: {latest_slot_text}\n"
+                "Recent thread history:\n"
+                f"{history_text}\n\n"
+                "Rules:\n"
+                "- If message confirms the latest proposed slot, use confirm_latest_slot.\n"
+                "- If message rejects that slot, use decline_latest_slot and provide a brief clarification_question.\n"
+                "- If message includes new concrete times, use new_time_details and put a parseable sentence in normalized_time_text.\n"
+                "- If unclear, use ask_clarification and provide one concise clarification_question."
+            ),
+        },
+    ]
+
+    try:
+        raw = call_for_text(messages, thread_id=thread_id, temperature=0.1, max_tokens=220).strip()
+        if not raw:
+            return default
+
+        json_start = raw.find("{")
+        json_end = raw.rfind("}")
+        if json_start != -1 and json_end != -1 and json_end >= json_start:
+            raw = raw[json_start : json_end + 1]
+
+        payload = json.loads(raw)
+
+        decision_raw = str(payload.get("decision_type", "ask_clarification")).strip().lower()
+        decision_map = {
+            "confirm_latest_slot": "confirm_latest_slot",
+            "confirm_previous_slot": "confirm_latest_slot",
+            "new_time_details": "new_time_details",
+            "new_slots_provided": "new_time_details",
+            "decline_latest_slot": "decline_latest_slot",
+            "decline_previous_slot": "decline_latest_slot",
+            "ask_clarification": "ask_clarification",
+        }
+        decision_type = decision_map.get(decision_raw, "ask_clarification")
+
+        try:
+            confidence = float(payload.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        confidence = max(0.0, min(1.0, confidence))
+        clarification_question = str(payload.get("clarification_question", "")).strip()
+        normalized_time_text = str(payload.get("normalized_time_text", "")).strip()
+
+        return {
+            "decision_type": decision_type,
+            "confidence": confidence,
+            "clarification_question": clarification_question,
+            "normalized_time_text": normalized_time_text,
+        }
+    except Exception:
+        return default
+
+
+def _apply_llm_fallback(
+    state: AgentState,
+    email_obj: EmailObject,
+    thread_id: str,
+    sender: str,
+    sender_tz: str,
+    fresh_body_text: str,
+    increment_ambiguity_round: bool = False,
+) -> str:
+    """
+    Apply LLM fallback decision and mutate state.
+    Returns one of: confirm_latest_slot, new_time_details, decline_latest_slot, ask_clarification.
+    """
+    decision = _llm_fallback_decision(state, email_obj, thread_id, sender, fresh_body_text)
+    decision_type = decision["decision_type"]
+    confidence = float(decision.get("confidence", 0.0))
+    confident = confidence >= LLM_FALLBACK_CONFIDENCE_THRESHOLD
+
+    if decision_type == "confirm_latest_slot" and confident:
+        latest_slot = _latest_proposed_slot(state, sender)
+        if latest_slot:
+            _track_slots_for_sender(state, thread_id, sender, [latest_slot])
+            append_to_history(
+                state,
+                "assistant",
+                f"LLM fallback confirmed latest proposed slot for {sender} (confidence={confidence:.2f}).",
+            )
+            logger.info(
+                "coordination_node: LLM fallback confirmed latest slot for %s (confidence=%.2f). Pending=%s",
+                sender,
+                confidence,
+                state["pending_responses"],
+                extra={"thread_id": thread_id},
+            )
+            return "confirm_latest_slot"
+
+    if decision_type == "new_time_details" and confident:
+        parse_text = decision.get("normalized_time_text") or fresh_body_text
+        avail_result = call_tool("parse_availability", {"text": parse_text, "sender_tz": sender_tz})
+        slots = avail_result.get("slots", [])
+        for slot in slots:
+            slot["participant"] = sender
+
+        if slots:
+            _track_slots_for_sender(state, thread_id, sender, slots)
+            append_to_history(
+                state,
+                "assistant",
+                f"LLM fallback parsed new time details from {sender} (confidence={confidence:.2f}).",
+            )
+            logger.info(
+                "coordination_node: LLM fallback parsed %d slot(s) for %s (confidence=%.2f). Pending=%s",
+                len(slots),
+                sender,
+                confidence,
+                state["pending_responses"],
+                extra={"thread_id": thread_id},
+            )
+            return "new_time_details"
+
+    if decision_type == "decline_latest_slot" and confident:
+        if sender not in state["pending_responses"]:
+            state["pending_responses"].append(sender)
+
+        if increment_ambiguity_round:
+            rounds = state["ambiguity_rounds"].get(sender, 0)
+            state["ambiguity_rounds"][sender] = rounds + 1
+
+        state["outbound_draft"] = decision.get("clarification_question") or (
+            "Understood. That slot does not work for you. "
+            "Please share 2-3 specific alternative windows in your timezone "
+            "(for example: Tuesday 08 Apr 14:00-15:00 UTC)."
+        )
+        append_to_history(
+            state,
+            "assistant",
+            f"LLM fallback detected decline from {sender}; requested alternatives (confidence={confidence:.2f}).",
+        )
+        logger.info(
+            "coordination_node: LLM fallback decline for %s (confidence=%.2f). Pending=%s",
+            sender,
+            confidence,
+            state["pending_responses"],
+            extra={"thread_id": thread_id},
+        )
+        return "decline_latest_slot"
+
+    if sender not in state["pending_responses"]:
+        state["pending_responses"].append(sender)
+
+    if increment_ambiguity_round:
+        rounds = state["ambiguity_rounds"].get(sender, 0)
+        state["ambiguity_rounds"][sender] = rounds + 1
+
+    state["outbound_draft"] = decision.get("clarification_question") or _build_llm_clarification(
+        email_obj,
+        thread_id,
+        state,
+    )
+    append_to_history(
+        state,
+        "assistant",
+        f"LLM fallback requested clarification from {sender} (decision={decision_type}, confidence={confidence:.2f}).",
+    )
+    logger.info(
+        "coordination_node: LLM fallback clarification for %s (decision=%s, confidence=%.2f). Pending=%s",
+        sender,
+        decision_type,
+        confidence,
+        state["pending_responses"],
+        extra={"thread_id": thread_id},
+    )
+    return "ask_clarification"
 
 
 def _build_llm_clarification(email_obj: EmailObject, thread_id: str, state: AgentState | None = None) -> str:
@@ -285,62 +564,14 @@ def coordination_node(state: AgentState, email_obj: EmailObject) -> AgentState:
         )
 
         if amb_result.get("is_ambiguous"):
-            if _is_affirmative_without_time(body_text):
-                inherited_slots = _inherit_slots_from_thread_context(state, sender)
-                if not inherited_slots:
-                    quoted_text = _extract_quoted_reply_text(body_text)
-                    if quoted_text:
-                        quoted_parse = call_tool(
-                            "parse_availability",
-                            {"text": quoted_text, "sender_tz": sender_tz},
-                        )
-                        inherited_slots = quoted_parse.get("slots", [])
-                        for slot in inherited_slots:
-                            slot["participant"] = sender
-                if inherited_slots:
-                    call_tool(
-                        "track_participant_slots",
-                        {
-                            "thread_id": thread_id,
-                            "email": sender,
-                            "slots": inherited_slots,
-                        },
-                    )
-
-                    existing = list(state["slots_per_participant"].get(sender, []))
-                    existing.extend(inherited_slots)
-                    state["slots_per_participant"][sender] = existing
-
-                    if sender in state["pending_responses"]:
-                        state["pending_responses"].remove(sender)
-
-                    state["outbound_draft"] = None
-                    append_to_history(
-                        state,
-                        "assistant",
-                        f"Affirmative reply from {sender}; inherited {len(inherited_slots)} slot(s) from thread context.",
-                    )
-                    logger.info(
-                        "coordination_node: affirmative from %s; inherited %d slot(s). Pending=%s",
-                        sender,
-                        len(inherited_slots),
-                        state["pending_responses"],
-                        extra={"thread_id": thread_id},
-                    )
-                    return state
-
-            rounds = state["ambiguity_rounds"].get(sender, 0)
-            state["ambiguity_rounds"][sender] = rounds + 1
-            state["outbound_draft"] = amb_result.get("question") or _build_llm_clarification(
+            _ = _apply_llm_fallback(
+                state,
                 email_obj,
                 thread_id,
-                state,
-            )
-            logger.info(
-                "coordination_node: ambiguity detected for %s (round %d)",
                 sender,
-                rounds + 1,
-                extra={"thread_id": thread_id},
+                sender_tz,
+                fresh_body_text,
+                increment_ambiguity_round=True,
             )
             return state
 
@@ -370,64 +601,16 @@ def coordination_node(state: AgentState, email_obj: EmailObject) -> AgentState:
         append_to_history(state, "user", email_obj.get("body", ""))
 
         if not slots:
-            if _is_affirmative_without_time(body_text):
-                inherited_slots = _inherit_slots_from_thread_context(state, sender)
-                if not inherited_slots:
-                    quoted_text = _extract_quoted_reply_text(body_text)
-                    if quoted_text:
-                        quoted_parse = call_tool(
-                            "parse_availability",
-                            {"text": quoted_text, "sender_tz": sender_tz},
-                        )
-                        inherited_slots = quoted_parse.get("slots", [])
-                        for slot in inherited_slots:
-                            slot["participant"] = sender
-                if inherited_slots:
-                    call_tool(
-                        "track_participant_slots",
-                        {
-                            "thread_id": thread_id,
-                            "email": sender,
-                            "slots": inherited_slots,
-                        },
-                    )
-
-                    existing = list(state["slots_per_participant"].get(sender, []))
-                    existing.extend(inherited_slots)
-                    state["slots_per_participant"][sender] = existing
-
-                    if sender in state["pending_responses"]:
-                        state["pending_responses"].remove(sender)
-
-                    state["outbound_draft"] = None
-                    append_to_history(
-                        state,
-                        "assistant",
-                        f"Affirmative fallback from {sender}; inherited {len(inherited_slots)} slot(s).",
-                    )
-                    logger.info(
-                        "coordination_node: affirmative fallback from %s; inherited %d slot(s). Pending=%s",
-                        sender,
-                        len(inherited_slots),
-                        state["pending_responses"],
-                        extra={"thread_id": thread_id},
-                    )
-                    return state
-
-            if sender not in state["pending_responses"]:
-                state["pending_responses"].append(sender)
-            state["outbound_draft"] = _build_llm_clarification(email_obj, thread_id, state)
-            append_to_history(
+            _ = _apply_llm_fallback(
                 state,
-                "assistant",
-                "No availability could be parsed; requesting clarification.",
-            )
-            logger.info(
-                "coordination_node: no availability parsed from %s. Pending=%s",
+                email_obj,
+                thread_id,
                 sender,
-                state["pending_responses"],
-                extra={"thread_id": thread_id},
+                sender_tz,
+                fresh_body_text,
+                increment_ambiguity_round=False,
             )
+            return state
         else:
             if sender in state["pending_responses"]:
                 state["pending_responses"].remove(sender)

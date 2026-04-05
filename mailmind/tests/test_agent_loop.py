@@ -40,6 +40,41 @@ def _email_obj(
     )
 
 
+def _coord_state(thread_id: str = "thread-coord-fallback") -> dict:
+    return {
+        "thread_id": thread_id,
+        "intent": "scheduling",
+        "participants": ["alice@example.com", "bob@example.com", "mailmind46@gmail.com"],
+        "slots_per_participant": {
+            "alice@example.com": [
+                {
+                    "start_utc": "2026-04-07T10:00:00+00:00",
+                    "end_utc": "2026-04-07T11:00:00+00:00",
+                    "participant": "alice@example.com",
+                    "raw_text": "Monday 10-11 UTC",
+                    "timezone": "UTC",
+                }
+            ]
+        },
+        "pending_responses": ["bob@example.com"],
+        "ranked_slot": None,
+        "outbound_draft": None,
+        "approval_status": "none",
+        "preferences": {"bob@example.com": {"timezone": "UTC"}},
+        "history": [],
+        "current_node": "coordination_node",
+        "ambiguity_rounds": {},
+        "non_responsive": [],
+        "overlap_candidates": [],
+        "rank_below_threshold": False,
+        "calendar_event_id": None,
+        "coordination_restart_count": 0,
+        "error": None,
+        "created_at": datetime(2026, 4, 4, 9, 0, tzinfo=timezone.utc).isoformat(),
+        "updated_at": datetime(2026, 4, 4, 9, 0, tzinfo=timezone.utc).isoformat(),
+    }
+
+
 class TestRouting:
     def test_route_by_intent(self):
         from agent.router import route_by_intent
@@ -163,7 +198,7 @@ class TestLoop:
         clear_mock.assert_called_once_with(email["thread_id"])
         saved = load_state(email["thread_id"])
         assert saved is not None
-        assert saved["current_node"] == "triage_node"
+        assert saved["current_node"] == "error_node"
 
     def test_loop_serializes_same_thread_id_runs(self):
         from agent.loop import run
@@ -230,3 +265,76 @@ class TestLoop:
         assert second_entered.is_set()
         saved = load_state(email["thread_id"])
         assert saved is not None
+
+
+class TestCoordinationLLMFallback:
+    @patch("agent.nodes.call_tool")
+    @patch("agent.nodes.call_for_text")
+    @patch("agent.nodes.call_with_tools")
+    def test_coordination_fallback_confirms_latest_slot(
+        self,
+        mock_call_with_tools,
+        mock_call_for_text,
+        mock_call_tool,
+    ):
+        mock_call_with_tools.return_value = {"is_ambiguous": True, "question": "Please clarify"}
+        mock_call_for_text.return_value = (
+            '{"decision_type":"confirm_latest_slot","confidence":0.93,'
+            '"clarification_question":"","normalized_time_text":""}'
+        )
+
+        def _tool_side_effect(name, _args):
+            if name == "track_participant_slots":
+                return {"tracked": True}
+            if name == "parse_availability":
+                return {"slots": [], "count": 0}
+            return {}
+
+        mock_call_tool.side_effect = _tool_side_effect
+
+        from agent.nodes import coordination_node
+
+        state = _coord_state("thread-confirm-latest")
+        email = _email_obj(
+            thread_id="thread-confirm-latest",
+            sender="bob@example.com",
+            body="Yes, I am available.",
+        )
+
+        result = coordination_node(state, email)
+
+        assert "bob@example.com" not in result["pending_responses"]
+        assert result["outbound_draft"] is None
+        assert len(result["slots_per_participant"].get("bob@example.com", [])) == 1
+
+    @patch("agent.nodes.call_tool")
+    @patch("agent.nodes.call_for_text")
+    @patch("agent.nodes.call_with_tools")
+    def test_coordination_fallback_decline_requests_alternatives(
+        self,
+        mock_call_with_tools,
+        mock_call_for_text,
+        mock_call_tool,
+    ):
+        mock_call_with_tools.return_value = {"is_ambiguous": True, "question": "Please clarify"}
+        mock_call_for_text.return_value = (
+            '{"decision_type":"decline_latest_slot","confidence":0.89,'
+            '"clarification_question":"Please share 2-3 alternative slots in UTC.",' 
+            '"normalized_time_text":""}'
+        )
+        mock_call_tool.return_value = {}
+
+        from agent.nodes import coordination_node
+
+        state = _coord_state("thread-decline-latest")
+        email = _email_obj(
+            thread_id="thread-decline-latest",
+            sender="bob@example.com",
+            body="No, this time does not work for me.",
+        )
+
+        result = coordination_node(state, email)
+
+        assert "bob@example.com" in result["pending_responses"]
+        assert result["outbound_draft"] == "Please share 2-3 alternative slots in UTC."
+        assert result["ambiguity_rounds"].get("bob@example.com") == 1
