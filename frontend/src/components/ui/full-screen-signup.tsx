@@ -1,6 +1,7 @@
 "use client";
 
 import { ArrowRight, Sparkles, SunIcon as Sunburst } from "lucide-react";
+import { signIn } from "next-auth/react";
 import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -12,13 +13,19 @@ export const FullScreenSignup = () => {
   const [emailError, setEmailError] = useState("");
   const [passwordError, setPasswordError] = useState("");
   const [submitted, setSubmitted] = useState(false);
+  const [googleEnabled, setGoogleEnabled] = useState(true);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const requestedNext = params.get("next");
+    const requestedGoogleState = params.get("google");
 
     if (requestedNext) {
       setNextPath(requestedNext);
+    }
+
+    if (requestedGoogleState === "off") {
+      setGoogleEnabled(false);
     }
   }, []);
 
@@ -30,7 +37,7 @@ export const FullScreenSignup = () => {
     return value.length >= 8;
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     let valid = true;
 
@@ -51,23 +58,19 @@ export const FullScreenSignup = () => {
     setSubmitted(true);
 
     if (valid) {
-      // Temporary client-only auth state. Replace with API session in backend integration.
-      window.localStorage.setItem("mailmind_auth", "true");
-      window.localStorage.setItem("mailmind_user", email);
-      window.alert("Login successful. Redirecting to dashboard...");
-      window.location.href = nextPath;
+      await signIn("credentials", {
+        email,
+        password,
+        callbackUrl: nextPath,
+      });
       setEmail("");
       setPassword("");
       setSubmitted(false);
     }
   };
 
-  const handleGoogleSignIn = () => {
-    // Placeholder until Google OAuth backend flow is connected.
-    window.localStorage.setItem("mailmind_auth", "true");
-    window.localStorage.setItem("mailmind_user", "manager@google-user.com");
-    window.alert("Google sign in successful. Redirecting to dashboard...");
-    window.location.href = nextPath;
+  const handleGoogleSignIn = async () => {
+    await signIn("google", { callbackUrl: nextPath });
   };
 
   return (
@@ -183,16 +186,18 @@ export const FullScreenSignup = () => {
               </div>
             </div>
 
-            <Button
-              type="button"
-              variant="outline"
-              size="lg"
-              className="h-11 w-full bg-white/90 hover:bg-white"
-              onClick={handleGoogleSignIn}
-            >
-              <Sunburst className="mr-1.5 h-4 w-4" />
-              Sign in with Google
-            </Button>
+            {googleEnabled ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                className="h-11 w-full bg-white/90 hover:bg-white"
+                onClick={handleGoogleSignIn}
+              >
+                <Sunburst className="mr-1.5 h-4 w-4" />
+                Sign in with Google
+              </Button>
+            ) : null}
 
             {submitted && emailError === "" && passwordError === "" ? (
               <p className="text-center text-xs text-muted-foreground">Submitting...</p>

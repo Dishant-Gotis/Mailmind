@@ -2,6 +2,7 @@
 
 import { motion } from "framer-motion";
 import { useEffect, useState } from "react";
+import { useSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import {
   Activity,
@@ -174,16 +175,18 @@ function timelineDot(type: string) {
 
 export default function DashboardPage() {
   const router = useRouter();
+  const { status } = useSession();
   const [authReady, setAuthReady] = useState(false);
 
   useEffect(() => {
-    const isAuthenticated = window.localStorage.getItem("mailmind_auth") === "true";
-    if (!isAuthenticated) {
+    if (status === "unauthenticated") {
       router.replace("/login?next=/dashboard");
       return;
     }
-    setAuthReady(true);
-  }, [router]);
+    if (status === "authenticated") {
+      setAuthReady(true);
+    }
+  }, [router, status]);
 
   if (!authReady) {
     return (
