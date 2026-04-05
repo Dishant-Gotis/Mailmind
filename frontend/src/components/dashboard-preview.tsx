@@ -273,8 +273,7 @@ export function DashboardPreview() {
                     Availability Request → Ravi Patel
                   </div>
                   <div className="text-[9px] text-muted-foreground">
-                    &quot;Hi Ravi, I&apos;d like to schedule a design review
-                    this week...&quot;
+                    &quot;Hi Ravi, I&apos;d like to schedule a design review this week...&quot;
                   </div>
                 </div>
                 <div className="flex items-center gap-1.5">
@@ -296,8 +295,7 @@ export function DashboardPreview() {
                     Confirmation Email → All Participants
                   </div>
                   <div className="text-[9px] text-muted-foreground">
-                    &quot;Meeting confirmed: Thursday 2:00 PM — 3:00 PM
-                    IST&quot;
+                    &quot;Meeting confirmed: Thursday 2:00 PM — 3:00 PM IST&quot;
                   </div>
                 </div>
                 <div className="flex items-center gap-1.5">

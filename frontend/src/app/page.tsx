@@ -218,7 +218,7 @@ export default function Home() {
             className="absolute inset-0 w-full h-full object-cover"
           >
             <source
-              src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260319_015952_e1deeb12-8fb7-4071-a42a-60779fc64ab6.mp4"
+              src="/hero.mp4"
               type="video/mp4"
             />
           </video>
@@ -353,7 +353,7 @@ export default function Home() {
           withBackground={true}
         >
           {/* Email Compose Mockup */}
-          <div className="rounded-xl border border-border bg-[#f5f3ef] p-4 shadow-sm">
+          <div className="rounded-xl border border-border bg-[#ffffff] p-4 shadow-sm">
             <div className="flex items-center gap-2 mb-3 pb-3 border-b border-border">
               <div className="h-7 w-7 rounded-full bg-accent/10 flex items-center justify-center">
                 <MessageSquare className="h-3.5 w-3.5 text-accent" />
@@ -420,7 +420,7 @@ export default function Home() {
           withBackground={true}
         >
           {/* Approval Queue Mockup */}
-          <div className="rounded-xl border border-border bg-[#f5f3ef] p-4 shadow-sm">
+          <div className="rounded-xl border border-border bg-[#ffffff] p-4 shadow-sm">
             <div className="flex items-center justify-between mb-3 pb-3 border-b border-border">
               <div className="flex items-center gap-2">
                 <Shield className="h-3.5 w-3.5 text-accent" />

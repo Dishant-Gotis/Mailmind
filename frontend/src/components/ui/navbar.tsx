@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { Button } from './button';
 
 const AnimatedNavLink = ({ href, children }: { href: string; children: React.ReactNode }) => {
@@ -15,6 +16,7 @@ const AnimatedNavLink = ({ href, children }: { href: string; children: React.Rea
 };
 
 export function Navbar() {
+  const router = useRouter();
   const [isOpen, setIsOpen] = useState(false);
   const [scrolled, setScrolled] = useState(false);
   const [headerShapeClass, setHeaderShapeClass] = useState('rounded-full');
@@ -88,7 +90,7 @@ export function Navbar() {
     >
 
       <div className="flex items-center justify-between w-full gap-x-6 sm:gap-x-8">
-        <a href="#" className="flex items-center gap-2 group">
+        <a href="/" className="flex items-center gap-2 group">
            {logoElement}
            <span className="text-base font-semibold tracking-tight text-foreground group-hover:text-accent transition-colors duration-200">
             MailMind
@@ -104,12 +106,18 @@ export function Navbar() {
         </nav>
 
         <div className="hidden md:flex items-center gap-2.5">
-          <Button variant="ghost" size="sm" className="rounded-full text-sm">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="rounded-full text-sm"
+            onClick={() => router.push('/login?mode=login&next=/dashboard')}
+          >
             Log In
           </Button>
           <Button
             size="sm"
             className="rounded-full text-sm"
+            onClick={() => router.push('/login?mode=signup&next=/dashboard')}
             style={{
               background: 'rgba(99, 102, 241, 0.9)',
               backdropFilter: 'blur(4px)',
@@ -138,10 +146,19 @@ export function Navbar() {
           ))}
         </nav>
         <div className="flex flex-col items-center space-y-3 mt-4 w-full">
-          <Button variant="ghost" size="sm" className="rounded-full w-full">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="rounded-full w-full"
+            onClick={() => router.push('/login?mode=login&next=/dashboard')}
+          >
             Log In
           </Button>
-          <Button size="sm" className="rounded-full w-full">
+          <Button
+            size="sm"
+            className="rounded-full w-full"
+            onClick={() => router.push('/login?mode=signup&next=/dashboard')}
+          >
             Get Started
           </Button>
         </div>
